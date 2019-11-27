@@ -1,0 +1,169 @@
+---
+title: "churn classifier R notebook"
+output: html_notebook
+---
+``` {r}
+#load the required packages
+library(tidyverse)
+library(tidymodels)
+library(skimr)
+library(knitr)
+```
+
+```{r}
+# read the data from the csv
+telco <- read_csv("WA_Fn-UseC_-Telco-Customer-Churn.csv")
+telco %>% head()
+```
+
+```{r}
+# skim the data
+telco %>% skim()
+```
+```{r}
+# high-level data pre-processing
+telco <- telco %>% select(-customerID) %>% drop_na()
+```
+
+```{r}
+# rsample: split into training and testing datasets
+set.seed(seed=1995)
+
+train_test_split <-
+  rsample::initial_split(
+    data = telco,
+    prop = 0.80
+  )
+
+train_tbl <- train_test_split %>% training()
+test_tbl <- train_test_split %>% testing()
+```
+
+```{r}
+# recipes: do pre-processing like transformations
+recipe_simple <- function(dataset) {
+  recipe(Churn ~ ., data = dataset) %>%
+    step_string2factor(all_nominal(), -all_outcomes()) %>%
+    prep(data = dataset)
+}
+
+recipe_prepped <- recipe_simple(dataset = train_tbl)
+
+train_baked <- bake(recipe_prepped, new_data = train_tbl)
+test_baked <- bake(recipe_prepped, new_data = test_tbl)
+```
+
+```{r}
+# parsnip: fit the basic log_reg model and make predictions
+logistic_glm <- logistic_reg(mode = "classification") %>%
+  set_engine("glm") %>%
+  fit(Churn ~ ., data = train_baked)
+
+predictions_glm <- logistic_glm %>%
+  predict(new_data = test_baked) %>%
+  bind_cols(test_baked %>% select(Churn))
+
+predictions_glm %>% head()
+```
+
+```{r}
+# construct the cofusion matrix
+predictions_glm %>%
+  conf_mat(Churn, .pred_class) %>%
+  pluck(1) %>%
+  as_tibble() %>%
+  
+  # ggplot: visualize the confusion matrix
+  ggplot(aes(Prediction, Truth, alpha = n)) +
+  geom_tile(show.legend = FALSE) +
+  geom_text(aes(label = n), colour = "white", alpha = 1, size = 8)
+```
+
+```{r}
+# calculate the overall accuracy
+predictions_glm %>%
+  metrics(Churn, .pred_class) %>%
+  select(-.estimator) %>%
+  filter(.metric == "accuracy")
+```
+
+```{r}
+# calculate the precision and recall
+tibble(
+  "precision" =
+      precision(predictions_glm, Churn, .pred_class) %>%
+      select(.estimate),
+  "recall" =
+      recall(predictions_glm, Churn, .pred_class) %>%
+      select(.estimate)
+) %>%
+  unnest(cols = c(precision, recall)) 
+```
+
+```{r}
+predictions_glm %>%
+  f_meas(Churn, .pred_class) %>%
+  select(-.estimator)
+```
+
+```{r}
+# 10-fold cross validation split
+cross_val_tbl <- vfold_cv(train_tbl, v = 10)
+cross_val_tbl %>% pluck("splits", 10)
+```
+
+```{r}
+# random forest with cv
+rf_fun <- function(split, id, try, tree) {
+  # get the training set for each fold
+  train_set <- split %>% analysis()
+  train_prepped <- train_set %>% recipe_simple()
+  train_baked <- train_prepped %>% bake(new_data = train_set)
+  
+  # train the model
+  model_rf <- 
+      rand_forest(
+          mode = "classification",
+          mtry = try,
+          trees = tree
+      ) %>%
+      set_engine("ranger",
+                 importance = "impurity"
+      ) %>%
+      fit(Churn ~ ., data = train_baked)
+  
+  # validate the model for that fold against the hold-out set
+  validation_set <- split %>% assessment()
+  validation_prepped <- validation_set %>% recipe_simple()
+  validation_baked <- validation_prepped %>% bake(new_data = validation_set)
+  
+  tibble(
+      "id" = id,
+      "truth" = validation_baked$Churn,
+      "prediction" = model_rf %>%
+          predict(new_data = validation_baked) %>%
+          unlist()
+  )
+}
+```
+
+```{r}
+# predict using the random forest model
+pred_rf <- map2_df(
+    .x = cross_val_tbl$splits,
+    .y = cross_val_tbl$id,
+    ~ rf_fun(split = .x, id = .y, try = 3, tree = 200)
+)
+
+head(pred_rf)
+```
+
+```{r}
+# yardstick: assess the performance
+pred_rf %>%
+    conf_mat(truth, prediction) %>%
+    summary() %>%
+    select(-.estimator) %>%
+    filter(.metric %in% c("accuracy", "precision", "recall", "f_meas")) %>%
+    head()
+```
